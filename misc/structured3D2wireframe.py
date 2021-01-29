@@ -140,6 +140,7 @@ def link_and_annotate(root, scene_dir, out_image_dir):
 
 def add_line_annotation(ann_3D, ann_2D, pose, out):
     R, t, K = parse_camera_info(pose, out['width'], out['height'])
+    K_inv = np.linalg.inv(K)
     T = np.block([
         [R, t],
         [np.array([0,0,0,1])]
@@ -171,13 +172,20 @@ def add_line_annotation(ann_3D, ann_2D, pose, out):
         if j12_img_px is None:
             continue
 
+        # print(j12_img)
+        # j12_img = K_inv@np.vstack([j12_img_px, np.ones([1,2])])
+        # print(j12_img)
+
         #Check occluding planes for overlap in image
         occluded, j12_img_visible = is_line_behind_planes(j12_img, img_planes, plane_junctions)
         if j12_img_visible is None:
             continue
 
+        # j12_img_px = K@j12_img_visible
+        # j12_img_px = j12_img_px[:2] / j12_img_px[2]
         modified, j12_img_px = line_to_img(j12_img_visible, K, img_poly = img_poly)
-        # Check if line was inside image bounds
+
+        #Check if line was inside image bounds
         if j12_img_px is None:
             continue
 
@@ -261,34 +269,35 @@ def is_line_behind_planes(line_points, planes, plane_junction_list):
     assert np.all(line_points[2] > -EPS)
 
     endp_occluded = np.zeros(2, dtype=np.bool)
-    new_line_points = np.copy(line_points)
+    new_line_points = line_points.copy()
 
+    # TODO: Note that each line may be split into multiple lines
     for p_idx, plane_junctions in enumerate(plane_junction_list):
         plane = planes[:,p_idx]
 
         # 0 < dist_frac < 1 => plane between camera and point
-        dist_frac = np.squeeze(- plane[3]/(plane[:3]@line_points + EPS))
+        dist_frac = - plane[3]/(plane[:3]@line_points + EPS)
         occluded = (0 < dist_frac) & (dist_frac < 1)
         # print('Frac:', dist_frac, 'Occluded: ', occluded)
         if not np.any(occluded):
             continue
 
         #Only larger dist_frac for development
-        print('Found plane occluding')
-        print(dist_frac)
-        endp_occluded |= occluded
+        # print('Found plane occluding')
+        # print(dist_frac)
 
         # Project point on plane and take intersection
         # Align X axis with line and Z axis with plane normal
         endp_plane = dist_frac*line_points
-        print(plane.shape, endp_plane.shape)
-        print('Endpoints on plane:', plane[:3]@endp_plane + plane[3])
-        print('Junctions on plane:',plane[:3]@plane_junctions + plane[3])
+        # print(plane.shape, endp_plane.shape)
+        # print('Endpoints on plane:', plane[:3]@endp_plane + plane[3])
+        # print('Junctions on plane:',plane[:3]@plane_junctions + plane[3])
         #Move origo to first end point
         t = -endp_plane[:,0].reshape([3,1])
+        # t = np.zeros_like(t)
         W = normalize(plane[:3])
         U = normalize(endp_plane[:,0] - endp_plane[:,1])
-        print(W.shape, U.shape)
+        # print(W.shape, U.shape)
         V = np.cross(W,U)
         R = np.vstack([U,V,W])
         T = np.block([
@@ -296,20 +305,36 @@ def is_line_behind_planes(line_points, planes, plane_junction_list):
             [np.array([0,0,0,1])]
         ])
         T_inv = np.linalg.inv(T)
-        print('Rotated')
+        # T_inv = T.T
         plane2 = T_inv.T@plane
         in_plane_junctions = T[:3,:3]@plane_junctions + T[:3,3,None]
         in_plane_endp = T[:3,:3]@endp_plane + T[:3,3,None]
 
-        print(plane_junctions.shape)
-        print(in_plane_junctions[0])
-        print(in_plane_junctions[1])
-        print(in_plane_junctions[2])
-        print(in_plane_endp)
-        print('Endpoints on plane:', plane2[:3]@in_plane_endp + plane2[3])
-        print('Junctions on plane:',plane2[:3]@in_plane_junctions + plane2[3])
+        # print(plane_junctions.shape)
+        # print(in_plane_junctions[0])
+        # print(in_plane_junctions[1])
+        # print(in_plane_junctions[2])
+        # print(in_plane_endp)
+        # print('Endpoints on plane:', plane2[:3]@in_plane_endp + plane2[3])
+        # print('Junctions on plane:',plane2[:3]@in_plane_junctions + plane2[3])
 
-        sys.exit()
+        p_poly_sg = sg.Polygon(in_plane_junctions[:2].T).convex_hull
+        p_line_sg = sg.LineString(in_plane_endp[:2].T)
+        line_segment = p_line_sg.difference(p_poly_sg)
+        if not isinstance(line_segment, sg.LineString):
+            #Cannot handle edge case yet
+            print(type(line_segment))
+            continue
+
+        if line_segment.is_empty:
+            new_line_points = None
+            break #exit here, no line left
+        else:
+            zval = in_plane_endp[2,0]
+            in_plane_seg = np.vstack([np.array(line_segment.coords).T, zval*np.ones([1,2])])
+            new_line_points = R.T@(in_plane_seg - t)
+            for i in range(2):
+                endp_occluded[i] |= not line_segment.boundary[i].equals(p_line_sg.boundary[i])
 
     return endp_occluded, new_line_points
 
