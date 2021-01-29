@@ -3,6 +3,8 @@ import scipy.io as sio
 import os
 import os.path as osp
 import cv2
+import matplotlib
+matplotlib.use('Cairo')
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
@@ -13,6 +15,7 @@ import shutil
 import shapely.geometry as sg
 OUTPATH = '/home/davidg/epnet/data/york'
 SRC = '/home/nxue2/lcnn/data/york_lcnn/valid'
+EPS = 1e-10
 PLANE_SEMANTIC_CLASSES = [
     'door',
     'window',
@@ -120,6 +123,7 @@ def link_and_annotate(root, scene_dir, out_image_dir):
             plt.figure()
             plt.imshow(img)
             add_line_annotation(ann_3D, ann_2D, pose, ann)
+            # plt.legend()
             plt.savefig(osp.join(plot_scene_dir, 'R{}P{}_3D_proj.png'.format(room_id, pos_id)))
 
             plt.figure()
@@ -128,9 +132,8 @@ def link_and_annotate(root, scene_dir, out_image_dir):
             for edge in ann['edges_positive']:
                 plt.plot((ann['junc'][edge[0],0], ann['junc'][edge[1],0]),
                          (ann['junc'][edge[0],1], ann['junc'][edge[1],1]))
-            plt.savefig(osp.join(plot_scene_dir, 'R{}P{}_2D.png'.format(room_id, pos_id)))
-            plt.show()
 
+            plt.savefig(osp.join(plot_scene_dir, 'R{}P{}_2D.png'.format(room_id, pos_id)))
             out_ann.append(ann)
 
     return out_ann
@@ -141,12 +144,13 @@ def add_line_annotation(ann_3D, ann_2D, pose, out):
         [R, t],
         [np.array([0,0,0,1])]
     ])
-    print(ann_3D['planeParams'].shape)
-    print(T.shape)
-    wall_mask = np.array([p['type'] == 'wall' for p in ann_3D['planes']], dtype=np.bool)
+    T_inv = np.linalg.inv(T)
+
+    # wall_mask = np.array([p['type'] == 'wall' for p in ann_3D['planes']], dtype=np.bool)
     # wall_planes = T@ann_3D['planeParams'][:,wall_mask]
-    img_planes = T@ann_3D['planeParams']
+    img_planes = T_inv.T@ann_3D['planeParams']
     img_junctions = R@ann_3D['junctionCoords'] + t
+    plane_junctions = [img_junctions[:,mask] for mask in ann_3D['planeJunctionMatrix']]
     img_poly = sg.box(0,0,out['width'], out['height'])
     junctions = []
     edges_pos = []
@@ -155,60 +159,175 @@ def add_line_annotation(ann_3D, ann_2D, pose, out):
         # Find junctions for line
         j12_img = img_junctions[:,ann_3D['lineJunctionMatrix'][l_idx]]
 
-        # Both end-points behind camera?
-        if np.all(j12_img[2] < 0):
+        behind, j12_img = line_to_front(j12_img)
+
+        # Check if line was in front of camera
+        if j12_img is None:
             continue
-        behind = j12_img[2] < 0
 
-        eps = 1e-10
-        if j12_img[2,0] < 0:
-            q = j12_img[:,0] - j12_img[:,1] + eps
-            j12_img[:,0] = j12_img[:,1] -(j12_img[2,1]/q[2])*q
-        elif j12_img[2,1] < 0:
-            q = j12_img[:,1] - j12_img[:,0] + eps
-            j12_img[:,1] = j12_img[:,0] -(j12_img[2,0]/q[2])*q
-
-        # Junctions occluded by planes?
-        # 0 < dist_frac < 1 => plane between camera and point
-        dist_frac = - img_planes[3]/(j12_img.T@img_planes[:3])
-        occluding_planes = (0 < dist_frac) & (dist_frac < 1)
-        occluded = np.any(occluding_planes, axis=1)
-
-        # Line in Pixel coordinates
-        j12_img = K@j12_img
-        j12_img /= (j12_img[2] + eps)
-        line = sg.LineString(j12_img[:2].T)
-
-        # Line in image bounds
-        line_img = img_poly.intersection(line)
+        modified, j12_img_px = line_to_img(j12_img, K, img_poly = img_poly)
 
         # Check if line was inside image bounds
-        if line_img.is_empty:
+        if j12_img_px is None:
             continue
 
         #Check occluding planes for overlap in image
+        occluded, j12_img_visible = is_line_behind_planes(j12_img, img_planes, plane_junctions)
+        if j12_img_visible is None:
+            continue
+
+        modified, j12_img_px = line_to_img(j12_img_visible, K, img_poly = img_poly)
+        # Check if line was inside image bounds
+        if j12_img_px is None:
+            continue
+
+
+        # occluded = np.zeros_like(modified)
+        true_junction = ~(modified | behind | occluded)
+        plt.plot(*j12_img_px, linestyle='solid', color='b', label='Line')
         for idx in range(2):
-            if not occluded[idx]:
-                continue
-            for p_idx in np.flatnonzero(occluding_planes[idx]):
-                p_junc = K@img_junctions[:,ann_3D['planeJunctionMatrix'][p_idx]]
-                p_junc /= p_junc[2] + eps
-                p_poly = sg.Polygon(p_junc[:2].T).convex_hull
-                p_poly = p_poly.intersection(img_poly)
-                plt.plot(*p_poly.exterior.xy, linestyle='dashed')
-
-
-        coords = np.array(line_img.coords)
-        plt.plot(coords[:,0], coords[:,1], linestyle='solid', color='b', label='Line')
-        for idx in range(2):
-            plt.plot(*coords[idx], marker='o', color='r' if behind[idx] else 'b')
-            if occluded[idx]:
-                plt.plot(*coords[idx], marker='x', color='g')
-
-
+            if true_junction[idx]:
+                plt.plot(*j12_img_px[:,idx], marker='o', color='b', label='true junction')
+            else:
+                if behind[idx]:
+                    plt.plot(*j12_img_px[:,idx], marker='o', color='r', label='behind')
+                if modified[idx]:
+                    plt.plot(*j12_img_px[:,idx], marker='x', color='k', label='modified')
+                if occluded[idx]:
+                    plt.plot(*j12_img_px[:,idx], marker='+', color='c', label='occluded')
 
     out['junc'] = img_junctions
     out['edges_positive'] = edges_pos
+
+def line_to_front(line_points):
+    """ Project a line segment in 3D to be in front of camera, assuming line is in camera homegenous coordinates.
+    I.e. Camera position is at origin.
+    line_points: 3x2, each column being a point.
+    """
+    behind = line_points[2] < 0
+
+    # Both end-points behind camera?
+    if np.all(line_points[2] < 0):
+        return behind, None
+
+    line_points = np.copy(line_points)
+
+    if line_points[2,0] < 0:
+        q = line_points[:,0] - line_points[:,1]
+        line_points[:,0] = line_points[:,1] -(line_points[2,1]/(q[2]+EPS))*q
+    elif line_points[2,1] < 0:
+        q = line_points[:,1] - line_points[:,0]
+        line_points[:,1] = line_points[:,0] -(line_points[2,0]/(q[2]+EPS))*q
+
+    return behind, line_points
+
+def line_to_img(line_points, K, img_poly = None, width = None, height = None):
+    """ Project a line segment in 3D FOV in image pixels.  Assumes camera is at origin and line in front of camera.
+    line_points: 3x2, each column being a point.
+    """
+    assert np.all(line_points[2] > -EPS)
+
+    # Construct image polygon if not supplied
+    if not img_poly:
+        img_poly = sg.box(0,0,width, height)
+
+    # Line in Pixel coordinates
+    line_points_px = K@line_points
+    line_points_px /= (line_points_px[2] + EPS)
+    line = sg.LineString(line_points_px[:2].T)
+
+    # Line in image bounds
+    line_img = img_poly.intersection(line)
+
+    # Check if line was inside image bounds
+    modified = np.zeros(2, dtype=np.bool)
+    if line_img.is_empty:
+        new_line_points = None
+    else:
+        new_line_points = np.array(line_img.coords).T
+        for i in range(2):
+            modified[i] |= not line_img.boundary[i].equals(line.boundary[i])
+
+    return modified, new_line_points
+
+
+def is_line_behind_planes(line_points, planes, plane_junction_list):
+    """ Assumes camera is at origin, checks if line is visible due to planes.
+    Assumes line in front of camera.
+    line_points: 3x2, each column being a point.
+    planes: 4xN coefficients for N planes.
+    plane_junction_list: List with 3xM junctions in each element, M may vary between planes
+    """
+    assert np.all(line_points[2] > -EPS)
+
+    endp_occluded = np.zeros(2, dtype=np.bool)
+    new_line_points = np.copy(line_points)
+
+    for p_idx, plane_junctions in enumerate(plane_junction_list):
+        plane = planes[:,p_idx]
+
+        # 0 < dist_frac < 1 => plane between camera and point
+        dist_frac = np.squeeze(- plane[3]/(plane[:3]@line_points + EPS))
+        occluded = (0 < dist_frac) & (dist_frac < 1)
+        # print('Frac:', dist_frac, 'Occluded: ', occluded)
+        if not np.any(occluded):
+            continue
+
+        #Only larger dist_frac for development
+        print('Found plane occluding')
+        print(dist_frac)
+        endp_occluded |= occluded
+
+        # Project point on plane and take intersection
+        # Align X axis with line and Z axis with plane normal
+        endp_plane = dist_frac*line_points
+        print(plane.shape, endp_plane.shape)
+        print('Endpoints on plane:', plane[:3]@endp_plane + plane[3])
+        print('Junctions on plane:',plane[:3]@plane_junctions + plane[3])
+        #Move origo to first end point
+        t = -endp_plane[:,0].reshape([3,1])
+        W = normalize(plane[:3])
+        U = normalize(endp_plane[:,0] - endp_plane[:,1])
+        print(W.shape, U.shape)
+        V = np.cross(W,U)
+        R = np.vstack([U,V,W])
+        T = np.block([
+            [R, R@t],
+            [np.array([0,0,0,1])]
+        ])
+        T_inv = np.linalg.inv(T)
+        print('Rotated')
+        plane2 = T_inv.T@plane
+        in_plane_junctions = T[:3,:3]@plane_junctions + T[:3,3,None]
+        in_plane_endp = T[:3,:3]@endp_plane + T[:3,3,None]
+
+        print(plane_junctions.shape)
+        print(in_plane_junctions[0])
+        print(in_plane_junctions[1])
+        print(in_plane_junctions[2])
+        print(in_plane_endp)
+        print('Endpoints on plane:', plane2[:3]@in_plane_endp + plane2[3])
+        print('Junctions on plane:',plane2[:3]@in_plane_junctions + plane2[3])
+
+        sys.exit()
+
+    return endp_occluded, new_line_points
+
+
+
+        # p_junc /= p_junc[2] + eps
+        # p_poly = sg.Polygon(p_junc[:2].T).convex_hull
+        # p_poly = p_poly.intersection(img_poly)
+        #
+        # plt.plot(*p_poly.exterior.xy, linestyle='dashed')
+
+
+
+
+
+
+
+
 
 def normalize(vector):
     return vector / np.linalg.norm(vector)
