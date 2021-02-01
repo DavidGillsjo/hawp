@@ -6,6 +6,7 @@ import cv2
 import matplotlib
 matplotlib.use('Cairo')
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 from PIL import Image
 import argparse
@@ -166,6 +167,7 @@ def add_line_annotation(ann_3D, ann_2D, pose, out):
         if j12_img is None:
             continue
 
+        print('first')
         modified, j12_img_px = line_to_img(j12_img, K, img_poly = img_poly)
 
         # Check if line was inside image bounds
@@ -183,6 +185,7 @@ def add_line_annotation(ann_3D, ann_2D, pose, out):
 
         # j12_img_px = K@j12_img_visible
         # j12_img_px = j12_img_px[:2] / j12_img_px[2]
+        print('second')
         modified, j12_img_px = line_to_img(j12_img_visible, K, img_poly = img_poly)
 
         #Check if line was inside image bounds
@@ -233,6 +236,8 @@ def line_to_img(line_points, K, img_poly = None, width = None, height = None):
     """ Project a line segment in 3D FOV in image pixels.  Assumes camera is at origin and line in front of camera.
     line_points: 3x2, each column being a point.
     """
+    if not np.all(line_points[2] > -EPS):
+        print(line_points[2])
     assert np.all(line_points[2] > -EPS)
 
     # Construct image polygon if not supplied
@@ -282,33 +287,108 @@ def is_line_behind_planes(line_points, planes, plane_junction_list):
         if not np.any(occluded):
             continue
 
+        endp_plane = dist_frac*line_points
+        if ~np.all(occluded):
+
+            # If one of the points are in front of the plane we need to find the intersection
+            # between line and plane
+            endp_plane2 = endp_plane.copy()
+            endp_idx = np.flatnonzero(~occluded)
+            print(occluded, endp_idx)
+            line_v = line_points[:,1,None]-line_points[:,0,None]
+            line_dist = -(plane[:3]@line_points[:,0] + plane[3])/(plane[:3]@line_v)
+            endp_plane2[:,endp_idx] = line_points[:,0,None] + line_dist*line_v
+            plane_eq = np.abs(plane[:3]@(line_points[:,0,None] + line_dist*line_v) + plane[3])
+            if plane_eq > EPS:
+                print(plane_eq)
+                print(line_dist)
+            assert np.linalg.norm(plane[:3]@plane_junctions + plane[3]) < 1e-5
+            # assert plane_eq < EPS
+
+            fig = plt.figure()
+            ax = fig.add_subplot(221, projection='3d')
+            ax.set_title('dist_frac {}, line dist {}'.format(dist_frac, line_dist))
+            ax.plot(0,0,0,'ko')
+            ax.plot(*line_points, 'b.-')
+            ax.plot(*endp_plane, 'g.-')
+            ax.plot(*endp_plane2, 'gx-')
+            ax.plot(*plane_junctions, 'ro')
+            ax.set_xlabel('X')
+            ax.set_ylabel('Y')
+            ax.set_zlabel('Z')
+            ax = fig.add_subplot(222)
+            ax.set_title('XY')
+            ax.plot(*line_points[:2], 'b.-')
+            ax.plot(*endp_plane[:2], 'g.-')
+            ax.plot(*endp_plane2[:2], 'gx-')
+            ax.plot(*plane_junctions[:2], 'ro')
+            ax.plot(0,0,'ko')
+            ax.set_xlabel('X')
+            ax.set_ylabel('Y')
+            ax = fig.add_subplot(223)
+            ax.set_title('YZ')
+            ax.plot(*line_points[1:], 'b.-')
+            ax.plot(*endp_plane[1:], 'g.-')
+            ax.plot(*endp_plane2[1:], 'gx-')
+            ax.plot(*plane_junctions[1:], 'ro')
+            ax.plot(0,0,'ko')
+            ax.set_xlabel('Y')
+            ax.set_ylabel('Z')
+            ax = fig.add_subplot(224)
+            ax.set_title('ZX')
+            ax.plot(*line_points[[2,0]], 'b.-')
+            ax.plot(*endp_plane[[2,0]], 'g.-')
+            ax.plot(*endp_plane2[[2,0]], 'gx-')
+            ax.plot(*plane_junctions[[2,0]], 'ro')
+            ax.plot(0,0,'ko')
+            ax.set_xlabel('Z')
+            ax.set_ylabel('X')
+            plt.tight_layout()
+
+
+            plt.savefig('/host_home/plots/hawp/debug/3D_{:03d}.svg'.format(p_idx))
+            plt.close(fig)
+            print('dist_frac', dist_frac)
+            print('line_dist', line_dist)
+            assert ((0 <= line_dist) and (line_dist <= 1))
+
+
+
+
+
         #Only larger dist_frac for development
         # print('Found plane occluding')
         # print(dist_frac)
 
         # Project point on plane and take intersection
         # Align X axis with line and Z axis with plane normal
-        endp_plane = dist_frac*line_points
+
         # print(plane.shape, endp_plane.shape)
         # print('Endpoints on plane:', plane[:3]@endp_plane + plane[3])
         # print('Junctions on plane:',plane[:3]@plane_junctions + plane[3])
         #Move origo to first end point
-        t = -endp_plane[:,0].reshape([3,1])
         # t = np.zeros_like(t)
         W = normalize(plane[:3])
         U = normalize(endp_plane[:,0] - endp_plane[:,1])
         # print(W.shape, U.shape)
         V = np.cross(W,U)
         R = np.vstack([U,V,W])
+        t = -R@endp_plane[:,0].reshape([3,1])
         T = np.block([
-            [R, R@t],
+            [R, t],
             [np.array([0,0,0,1])]
         ])
         T_inv = np.linalg.inv(T)
         # T_inv = T.T
         plane2 = T_inv.T@plane
-        in_plane_junctions = T[:3,:3]@plane_junctions + T[:3,3,None]
-        in_plane_endp = T[:3,:3]@endp_plane + T[:3,3,None]
+        in_plane_junctions = R@plane_junctions + t
+        in_plane_endp = R@endp_plane + t
+
+        # inv_in_plane_endp = R.T@(in_plane_endp - t)
+        # if ~np.all(np.abs(inv_in_plane_endp - endp_plane) < 1e-5):
+        #     print(np.abs(inv_in_plane_endp - endp_plane))
+        #
+        # assert np.all(np.abs(inv_in_plane_endp - endp_plane) < 1e-5)
 
         # print(plane_junctions.shape)
         # print(in_plane_junctions[0])
@@ -318,23 +398,61 @@ def is_line_behind_planes(line_points, planes, plane_junction_list):
         # print('Endpoints on plane:', plane2[:3]@in_plane_endp + plane2[3])
         # print('Junctions on plane:',plane2[:3]@in_plane_junctions + plane2[3])
 
+        # fig = plt.figure()
         p_poly_sg = sg.Polygon(in_plane_junctions[:2].T).convex_hull
         p_line_sg = sg.LineString(in_plane_endp[:2].T)
+        # plt.plot(*np.array(p_poly_sg.boundary.coords).T, 'b.-')
+        # plt.plot(*np.array(p_line_sg.coords).T, 'r.-')
+
+        if p_line_sg.disjoint(p_poly_sg):
+            # plt.savefig('/host_home/plots/hawp/debug/disjoint{:03d}.svg'.format(p_idx))
+            # plt.close(fig)
+            continue
+
         line_segment = p_line_sg.difference(p_poly_sg)
         if not isinstance(line_segment, sg.LineString):
             #Cannot handle edge case yet
+            # for ls in line_segment:
+            #     plt.plot(*np.array(ls.coords).T, 'g.-')
+            # plt.savefig('/host_home/plots/hawp/debug/multisegment{:03d}.svg'.format(p_idx))
+            # plt.close(fig)
             print(type(line_segment))
-            continue
+            new_line_points = None
+            break
 
         if line_segment.is_empty:
             new_line_points = None
+            # plt.savefig('/host_home/plots/hawp/debug/empty{:03d}.svg'.format(p_idx))
+            # plt.close(fig)
             break #exit here, no line left
         else:
-            zval = in_plane_endp[2,0]
+            # zval = in_plane_endp[2,0]
+            # plt.plot(*np.array(line_segment.coords).T, 'g.-')
+            zval = 0
             in_plane_seg = np.vstack([np.array(line_segment.coords).T, zval*np.ones([1,2])])
             new_line_points = R.T@(in_plane_seg - t)
+            if np.any(new_line_points[2] < 0 ):
+                print("Error")
+                print('Dist frac')
+                print(dist_frac)
+                print("Line prior projeciton")
+                print(line_points)
+                print('Line ')
+                print(endp_plane)
+                print('Line in plane ')
+                print(in_plane_endp)
+                print('cut Line in plane')
+                print(in_plane_seg)
+                print('cut Line in world')
+                print(new_line_points)
+                # plt.savefig('/host_home/plots/hawp/debug/negative{:03d}.svg'.format(p_idx))
+                # plt.close(fig)
+                sys.exit()
             for i in range(2):
                 endp_occluded[i] |= not line_segment.boundary[i].equals(p_line_sg.boundary[i])
+
+        # plt.savefig('/host_home/plots/hawp/debug/adjusted{:03d}.svg'.format(p_idx))
+        # plt.close(fig)
 
     return endp_occluded, new_line_points
 
@@ -348,11 +466,11 @@ def is_line_behind_planes(line_points, planes, plane_junction_list):
 
 
 
+def pflat(points):
+    return points/points[-1]
 
-
-
-
-
+def pextend(points):
+    return np.vstack([points, np.ones([1,points.shape[1]])])
 
 def normalize(vector):
     return vector / np.linalg.norm(vector)
@@ -411,7 +529,7 @@ if __name__ == '__main__':
     out_image_dir = osp.join(args.out_dir, 'images')
     os.makedirs(out_image_dir)
 
-    dirs = os.listdir(args.data_dir)
+    dirs = sorted(os.listdir(args.data_dir))
     if args.nbr_scenes:
         dirs = dirs[:args.nbr_scenes]
 
