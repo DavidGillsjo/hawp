@@ -170,7 +170,6 @@ def add_line_annotation(ann_3D, ann_2D, pose, out):
         if j12_img is None:
             continue
 
-        print('first')
         _, j12_img_px = line_to_img(j12_img, K, img_poly = img_poly)
 
         # Check if line was inside image bounds
@@ -187,7 +186,6 @@ def add_line_annotation(ann_3D, ann_2D, pose, out):
 
         # j12_img_px = K@j12_img_visible
         # j12_img_px = j12_img_px[:2] / j12_img_px[2]
-        print('second')
         modified_list_pix = []
         segment_list_pix = []
         for mod, seg in zip(modified_list, segment_list):
@@ -204,12 +202,12 @@ def add_line_annotation(ann_3D, ann_2D, pose, out):
         for mod, seg in zip(modified_list_pix, segment_list_pix):
             # occluded = np.zeros_like(modified)
             # true_junction = ~(modified | behind | occluded)
-            plt.plot(*j12_img_px, linestyle='solid', color='b', label='Line')
+            plt.plot(*seg, linestyle='solid', color='b', label='Line')
             for idx in range(2):
                 if mod[idx]:
-                    plt.plot(*j12_img_px[:,idx], marker='o', color='r', label='behind')
+                    plt.plot(*seg[:,idx], marker='.', color='r', label='behind')
                 else:
-                    plt.plot(*j12_img_px[:,idx], marker='o', color='b', label='true junction')
+                    plt.plot(*seg[:,idx], marker='.', color='b', label='true junction')
 
     out['junc'] = img_junctions
     out['edges_positive'] = edges_pos
@@ -240,13 +238,11 @@ def line_to_img(line_points, K, img_poly = None, width = None, height = None):
     """ Project a line segment in 3D FOV in image pixels.  Assumes camera is at origin and line in front of camera.
     line_points: 3x2, each column being a point.
     """
-    if not np.all(line_points[2] > -CMP_EPS):
-        print(line_points[2])
     assert np.all(line_points[2] > -CMP_EPS)
 
     # Construct image polygon if not supplied
     if not img_poly:
-        img_poly = sg.box(0,0,width, height)
+        img_poly = sg.box(0, 0, width, height)
 
     # Line in Pixel coordinates
     line_points_px = K@line_points
@@ -254,29 +250,18 @@ def line_to_img(line_points, K, img_poly = None, width = None, height = None):
     line = sg.LineString(line_points_px[:2].T)
 
     # Line in image bounds
-    print(img_poly)
-    print(line)
-    try:
-        line_img = img_poly.intersection(line)
-    except shapely.errors.TopologicalError as e:
-        fig = plt.figure()
-        plt.plot(*np.array(img_poly.boundary.coords).T, '.-b')
-        plt.plot(*np.array(line.coords).T, '.-r')
-        plt.xlim([-1, 2000])
-        plt.ylim([-1, 2000])
-        plt.savefig('/host_home/plots/hawp/debug/error.svg')
-        plt.close(fig)
+    line_img = img_poly.intersection(line)
 
     # Check if line was inside image bounds
-    modified = np.zeros(2, dtype=np.bool)
-    if line_img.is_empty:
+    unmodified = np.zeros(2, dtype=np.bool)
+    if line_img.is_empty or isinstance(line_img, sg.Point):
         new_line_points = None
     else:
         new_line_points = np.array(line_img.coords).T
         for i in range(2):
-            modified[i] |= not line_img.boundary[i].equals(line.boundary[i])
+                unmodified |= (np.linalg.norm(line_points_px[:2,i] - new_line_points, axis=0) < 1e-5)
 
-    return modified, new_line_points
+    return ~unmodified, new_line_points
 
 
 def get_visible_segments(modified, line_points, planes, plane_junction_list):
@@ -296,7 +281,6 @@ def get_visible_segments(modified, line_points, planes, plane_junction_list):
     for plane, plane_junctions in zip(planes.T, plane_junction_list):
         valid_modified = []
         valid_segments = []
-        print('modout',modified_out)
         for line_points, modified in zip(line_segments_out, modified_out):
             add_visible_segments_single_plane(modified, line_points, plane, plane_junctions, valid_modified, valid_segments, P_IDX=P_IDX)
         modified_out = valid_modified
