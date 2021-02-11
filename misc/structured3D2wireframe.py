@@ -128,17 +128,22 @@ def link_and_annotate(root, scene_dir, out_image_dir):
             plt.imshow(img)
             add_line_annotation(ann_3D, ann_2D, pose, ann)
             # plt.legend()
+            plt.colorbar()
             plt.savefig(osp.join(plot_scene_dir, 'R{}P{}_3D_proj.png'.format(room_id, pos_id)))
 
-            # plt.figure()
-            # plt.imshow(img)
+
+            plt.figure()
+            plt.imshow(img)
+            coords2d = np.array([j['coordinate'] for j in ann_2D['junctions']])
+            plt.plot(*coords2d.T, '.')
             # plt.plot(ann['junc'][:,0], ann['junc'][:,1], '.')
             # for edge in ann['edges_positive']:
             #     plt.plot((ann['junc'][edge[0],0], ann['junc'][edge[1],0]),
             #              (ann['junc'][edge[0],1], ann['junc'][edge[1],1]))
             #
-            # plt.savefig(osp.join(plot_scene_dir, 'R{}P{}_2D.png'.format(room_id, pos_id)))
+            plt.savefig(osp.join(plot_scene_dir, 'R{}P{}_2D.png'.format(room_id, pos_id)))
             out_ann.append(ann)
+            # return out_ann #DEBUG
 
     return out_ann
 
@@ -165,6 +170,7 @@ def add_line_annotation(ann_3D, ann_2D, pose, out):
         j12_img = img_junctions[:,ann_3D['lineJunctionMatrix'][l_idx]]
 
         modified, j12_img = line_to_front(j12_img)
+        planes_mask = ann_3D['planeLineMatrix'][:,l_idx]
 
         # Check if line was in front of camera
         if j12_img is None:
@@ -180,34 +186,46 @@ def add_line_annotation(ann_3D, ann_2D, pose, out):
         # j12_img = K_inv@np.vstack([j12_img_px, np.ones([1,2])])
         # print(j12_img)
         #Check occluding planes for overlap in image
-        modified_list, segment_list = get_visible_segments(modified, j12_img, img_planes, plane_junctions)
+        modified_list, segment_list = get_visible_segments(modified, j12_img, img_planes, plane_junctions, planes_mask, l_idx = l_idx)
         if not segment_list:
             continue
+
+        print('------------------ l_idx {} ------------------'.format(l_idx))
+        print('Line semantics', [ann_3D['planes'][id]['semantic'] for id in np.flatnonzero(planes_mask)])
+        print('Modified line to front', modified)
 
         # j12_img_px = K@j12_img_visible
         # j12_img_px = j12_img_px[:2] / j12_img_px[2]
         modified_list_pix = []
         segment_list_pix = []
+        segment_list_z = []
         for mod, seg in zip(modified_list, segment_list):
-            mod_pix, seg_pix = line_to_img(seg, K, img_poly = img_poly)
+            print('Modified occlusion', mod)
+            mod_pix, seg_pix = line_to_img(seg, K, img_poly = img_poly, l_idx=l_idx)
+            print('Modified to img', mod_pix)
             if seg_pix is not None:
                 segment_list_pix.append(seg_pix)
                 modified_list_pix.append(mod | mod_pix)
+                segment_list_z.append(seg[2])
 
 
         #Check if line was inside image bounds
         if not segment_list_pix:
             continue
 
-        for mod, seg in zip(modified_list_pix, segment_list_pix):
+        for mod, seg, z in zip(modified_list_pix, segment_list_pix, segment_list_z):
+            print('Z: ', z)
             # occluded = np.zeros_like(modified)
             # true_junction = ~(modified | behind | occluded)
             plt.plot(*seg, linestyle='solid', color='b', label='Line')
+            plt.text(*np.mean(seg, axis=1), str(l_idx), rotation=45)
+            # plt.scatter(*seg, c=z)
             for idx in range(2):
                 if mod[idx]:
                     plt.plot(*seg[:,idx], marker='.', color='r', label='behind')
                 else:
                     plt.plot(*seg[:,idx], marker='.', color='b', label='true junction')
+
 
     out['junc'] = img_junctions
     out['edges_positive'] = edges_pos
@@ -228,13 +246,15 @@ def line_to_front(line_points):
     if line_points[2,0] < 0:
         q = line_points[:,0] - line_points[:,1]
         line_points[:,0] = line_points[:,1] -(line_points[2,1]/(q[2]+DIV_EPS))*q
+        line_points[2,0] = 0 # Make sure it is actually 0 since this assumed in occlusion check
     elif line_points[2,1] < 0:
         q = line_points[:,1] - line_points[:,0]
         line_points[:,1] = line_points[:,0] -(line_points[2,0]/(q[2]+DIV_EPS))*q
+        line_points[2,1] = 0 # Make sure it is actually 0 since this assumed in occlusion check
 
     return behind, line_points
 
-def line_to_img(line_points, K, img_poly = None, width = None, height = None):
+def line_to_img(line_points, K, img_poly = None, width = None, height = None, l_idx = None):
     """ Project a line segment in 3D FOV in image pixels.  Assumes camera is at origin and line in front of camera.
     line_points: 3x2, each column being a point.
     """
@@ -259,17 +279,30 @@ def line_to_img(line_points, K, img_poly = None, width = None, height = None):
     else:
         new_line_points = np.array(line_img.coords).T
         for i in range(2):
-                unmodified |= (np.linalg.norm(line_points_px[:2,i] - new_line_points, axis=0) < 1e-5)
+            unmodified |= (np.linalg.norm(line_points_px[:2] - new_line_points[:,i,None], axis=0) < 1e-5)
+        # if l_idx:
+        #     plt.figure()
+        #     plt.plot(*np.array(img_poly.boundary.coords).T, 'b.-')
+        #     plt.plot(*line_points_px[:2], 'r.-')
+        #     plt.plot(*new_line_points, 'g.-')
+        #     for i in range(2):
+        #             # plt.text(*new_line_points[:,i], 'Diff: {}'.format(line_points_px[:2] - new_line_points[:,i]))
+        #             plt.text(*new_line_points[:,i], 'Diff: {}'.format(np.linalg.norm(line_points_px[:2] - new_line_points[:,i,None], axis=0)), rotation=45)
+        #             plt.plot(*new_line_points[:,i], 'b.' if unmodified[i] else 'b*')
+        #     plt.title('Points: {}'.format(line_points_px[:2]))
+        #     plt.savefig('/host_home/plots/hawp/debug/toline_{:03d}.svg'.format(l_idx))
+        #     plt.close()
 
     return ~unmodified, new_line_points
 
 
-def get_visible_segments(modified, line_points, planes, plane_junction_list):
+def get_visible_segments(modified, line_points, planes, plane_junction_list, plane_line_mask, l_idx = None):
     """ Assumes camera is at origin, checks if line is visible due to planes.
     Assumes line in front of camera.
     line_points: 3x2, each column being a point.
     planes: 4xN coefficients for N planes.
     plane_junction_list: List with 3xM junctions in each element, M may vary between planes
+    plane_line_mask: Bool vector of which planes the line belong to.
     """
     assert np.all(line_points[2] > -CMP_EPS)
 
@@ -278,11 +311,16 @@ def get_visible_segments(modified, line_points, planes, plane_junction_list):
     P_IDX = 0
 
     # For each plane check if the line segment is occluded
-    for plane, plane_junctions in zip(planes.T, plane_junction_list):
+    for p_idx, (plane, plane_junctions) in enumerate(zip(planes.T, plane_junction_list)):
+
+        if plane_line_mask[p_idx]:
+            #Skip check if line is in plane
+            continue
+
         valid_modified = []
         valid_segments = []
         for line_points, modified in zip(line_segments_out, modified_out):
-            add_visible_segments_single_plane(modified, line_points, plane, plane_junctions, valid_modified, valid_segments, P_IDX=P_IDX)
+            add_visible_segments_single_plane(modified, line_points, plane, plane_junctions, valid_modified, valid_segments, P_IDX=P_IDX, l_idx = l_idx)
         modified_out = valid_modified
         line_segments_out = valid_segments
         P_IDX += 1
@@ -293,22 +331,33 @@ def get_visible_segments(modified, line_points, planes, plane_junction_list):
 
     return modified_out, line_segments_out
 
-
-def add_visible_segments_single_plane(modified, line_points, plane, plane_junctions, valid_modified, valid_segments, P_IDX = 0):
+# DBG_LIDX = 54
+DBG_LIDX = -1
+def add_visible_segments_single_plane(modified, line_points, plane, plane_junctions, valid_modified, valid_segments, P_IDX = 0, l_idx = None):
     # 0 < dist_frac < 1 => plane between camera and point
+
+    assert np.all(line_points[2] > -CMP_EPS)
+    #Make all z positive
+    line_points[2] = np.abs(line_points[2])
+
+    #Figure out where the viewing ray cuts the plane
     dist_frac = - plane[3]/(plane[:3]@line_points + DIV_EPS)
     occluded = (CMP_EPS < dist_frac) & (dist_frac < 1 - CMP_EPS)
-    print('Frac:', dist_frac, 'Occluded: ', occluded)
+
+    if l_idx == DBG_LIDX: print('Frac:', dist_frac, 'Occluded: ', occluded)
+    # print('Frac:', dist_frac, 'Occluded: ', occluded)
     if not np.any(occluded):
         # No occlusion, skip
         valid_modified.append(modified)
         valid_segments.append(line_points)
+        if l_idx == DBG_LIDX: print('OK')
         return
+
 
     # Projection to plane along viewing ray.
     endp_plane = dist_frac*line_points
-    print('line_points', line_points)
-    print('endp_plane', endp_plane)
+    # print('line_points', line_points)
+    # print('endp_plane', endp_plane)
 
     if ~np.all(occluded):
         """
@@ -328,13 +377,16 @@ def add_visible_segments_single_plane(modified, line_points, plane, plane_juncti
             # No part of the line is free
             free_idx = None
             mod_idx = None
+            if l_idx == DBG_LIDX: print('No part free')
         elif np.abs(line_dist - 1) < CMP_EPS:
             # All line is free
             valid_modified.append(modified)
             valid_segments.append(line_points)
+            if l_idx == DBG_LIDX: print('OK')
             return
 
-        if not ((-CMP_EPS < line_dist) and (line_dist < 1 + CMP_EPS)):
+        # if not ((-CMP_EPS < line_dist) and (line_dist < 1 + CMP_EPS)):
+        if l_idx == DBG_LIDX:
             fig = plt.figure()
             ax = fig.add_subplot(221, projection='3d')
             ax.set_title('dist_frac {}, line dist {}'.format(dist_frac, line_dist))
@@ -374,16 +426,17 @@ def add_visible_segments_single_plane(modified, line_points, plane, plane_juncti
             plt.savefig('/host_home/plots/hawp/debug/3D_{:03d}.svg'.format(P_IDX))
             plt.close(fig)
 
-        print(plane_eq)
+        # print(plane_eq)
         assert plane_eq < CMP_EPS
-        print(line_dist)
+        # print(line_dist)
         assert ((-CMP_EPS < line_dist) and (line_dist < 1 + CMP_EPS))
-        print('One occluded')
-        print('line_dist', line_dist)
+        # print('line_dist', line_dist)
+        if l_idx == DBG_LIDX: print('One occluded')
     else:
         free_idx = None
         mod_idx = None
-        print('All occluded')
+        if l_idx == DBG_LIDX: print('All occluded')
+        # print('All occluded')
 
 
     """
@@ -423,24 +476,25 @@ def add_visible_segments_single_plane(modified, line_points, plane, plane_juncti
     # print('Endpoints on plane:', plane2[:3]@in_plane_endp + plane2[3])
     # print('Junctions on plane:',plane2[:3]@in_plane_junctions + plane2[3])
 
-    # fig = plt.figure()
+
     p_poly_sg = sg.Polygon(in_plane_junctions[:2].T).convex_hull
     p_line_sg = sg.LineString(in_plane_endp[:2].T)
-    # plt.plot(*np.array(p_poly_sg.boundary.coords).T, 'b.-')
-    # plt.plot(*np.array(p_line_sg.coords).T, 'r.-')
+
 
     if p_line_sg.disjoint(p_poly_sg):
         """ No occlusion, line and plane are not overlapping """
         valid_modified.append(modified)
         valid_segments.append(line_points)
         assert np.linalg.norm(line_points[:,0] - line_points[:,1]) > 1e-5
+        if l_idx == DBG_LIDX: print('No overlap')
         return
+
 
     """
     We know that there is some occlusion, we can now add the
     non-occluded section if only one endpoint was behind the plane
     """
-    if free_idx:
+    if free_idx is not None:
         new_modified = modified.copy()
         new_modified[mod_idx] = True
         new_line_points = line_points.copy()
@@ -448,6 +502,7 @@ def add_visible_segments_single_plane(modified, line_points, plane, plane_juncti
         valid_modified.append(new_modified)
         valid_segments.append(new_line_points)
         assert np.linalg.norm(new_line_points[:,0] - new_line_points[:,1]) > 1e-5
+        if l_idx == DBG_LIDX: print('Partly occluded')
 
         #Adjust modified to reflect the remaining segment
         modified[free_idx] = True
@@ -458,28 +513,39 @@ def add_visible_segments_single_plane(modified, line_points, plane, plane_juncti
         # There is only one segment
         visible_segments = [visible_segments]
 
+    if l_idx == DBG_LIDX:
+        fig = plt.figure()
+        plt.plot(*np.array(p_poly_sg.boundary.coords).T, 'b.-')
+        plt.plot(*np.array(p_line_sg.coords).T, 'r.-')
+
+
     for line_segment in visible_segments:
         if line_segment.is_empty or (line_segment.length < 1e-5):
             # No visible segment
+            if l_idx == DBG_LIDX: print('No visible segment')
             continue
 
+
         # zval = in_plane_endp[2,0]
-        # plt.plot(*np.array(line_segment.coords).T, 'g.-')
+
         zval = 0
         in_plane_seg = np.vstack([np.array(line_segment.coords).T, zval*np.ones([1,2])])
         new_line_points = R.T@(in_plane_seg - t)
         unmodified = np.zeros_like(modified)
         original_idx = np.flatnonzero(~modified)
+        #TODO:Better loop
         for oidx in original_idx:
-            original_coord = in_plane_endp[:,oidx]
+            original_coord = in_plane_endp[:, oidx]
             for j in range(2):
                 unmodified[j] |= (np.linalg.norm(in_plane_seg[:,j] - original_coord) < 1e-5)
 
 
-        print('unmodified', unmodified.shape)
+        # TODO: Need to append to previous part somehow
         valid_modified.append(~unmodified)
         valid_segments.append(new_line_points)
-        print(new_line_points)
+        if l_idx == DBG_LIDX:
+             print('Append part')
+             plt.plot(*np.array(line_segment.coords).T, 'g.-')
         assert np.linalg.norm(new_line_points[:,0] - new_line_points[:,1]) > 1e-5
 
         if np.any(new_line_points[2] < -CMP_EPS ):
@@ -500,8 +566,9 @@ def add_visible_segments_single_plane(modified, line_points, plane, plane_juncti
             # plt.close(fig)
             sys.exit()
 
-    # plt.savefig('/host_home/plots/hawp/debug/adjusted{:03d}.svg'.format(p_idx))
-    # plt.close(fig)
+    if l_idx == DBG_LIDX:
+        plt.savefig('/host_home/plots/hawp/debug/adjusted{:03d}.svg'.format(P_IDX))
+        plt.close(fig)
 
 
 def pflat(points):
